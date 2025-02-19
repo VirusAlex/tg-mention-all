@@ -1,0 +1,26 @@
+services:
+  bot:
+    build: .
+    image: mention_all_bot
+    container_name: mention_all_bot
+    env_file:
+      - .env
+    restart: unless-stopped
+    depends_on:
+      - redis
+    logging:
+      driver: "json-file"
+      options:
+        max-file: "5"
+        max-size: "10m"
+
+  redis:
+    image: redis:alpine
+    container_name: mention_all_bot_redis
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+
+volumes:
+  redis_data:
