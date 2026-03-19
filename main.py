@@ -210,16 +210,28 @@ async def mention_all(client, message):
                 name = user.first_name or "NoName"
                 mentions.append(f"[{name}](tg://user?id={user.id})")
 
-        # Form the final text
-        text = " ".join(mentions)
-        if text:
-            await message.reply_text(
-                text,
-                disable_web_page_preview=True,
-                quote=True
-            )
-        else:
+        # Form the final text, splitting into chunks if needed
+        if not mentions:
             await message.reply_text("No suitable members found to mention.")
+        else:
+            max_length = 4096
+            chunks = []
+            current_chunk = ""
+            for mention in mentions:
+                if current_chunk and len(current_chunk) + 1 + len(mention) > max_length:
+                    chunks.append(current_chunk)
+                    current_chunk = mention
+                else:
+                    current_chunk = f"{current_chunk} {mention}" if current_chunk else mention
+            if current_chunk:
+                chunks.append(current_chunk)
+
+            for i, chunk in enumerate(chunks):
+                await message.reply_text(
+                    chunk,
+                    disable_web_page_preview=True,
+                    quote=(i == 0)
+                )
     except Exception as e:
         await message.reply_text(f"Failed to mention members: {str(e)}")
 
