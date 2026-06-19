@@ -2,7 +2,11 @@
 
 A Telegram bot that helps mention all members in a group chat. Built with Python and Pyrogram.
 
+[![Publish Docker image](https://github.com/VirusAlex/tg-mention-all/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/VirusAlex/tg-mention-all/actions/workflows/docker-publish.yml)
 [![Docker image](https://img.shields.io/badge/ghcr.io-tg--mention--all-2496ED?logo=docker&logoColor=white)](https://github.com/VirusAlex/tg-mention-all/pkgs/container/tg-mention-all)
+[![Python](https://img.shields.io/badge/python-3.10+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Pyrogram](https://img.shields.io/badge/Pyrogram-2.0-FF8C00)](https://docs.pyrogram.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ## Features
 
