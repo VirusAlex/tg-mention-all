@@ -1,8 +1,17 @@
 import os
+import asyncio
+import logging
 from pyrogram import Client, filters
+from pyrogram.errors import AuthKeyDuplicated
 import redis
 from pyrogram.types import Message
 from pyrogram.enums import ChatMemberStatus, ChatType
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+log = logging.getLogger(__name__)
 
 # 1. Acquire API ID and API Hash from https://my.telegram.org/apps
 api_id = int(os.environ.get("TELEGRAM_API_ID"))
@@ -235,5 +244,83 @@ async def mention_all(client, message):
     except Exception as e:
         await message.reply_text(f"Failed to mention members: {str(e)}")
 
-# Bot start
-app.run()
+# Health check interval and tolerance
+HEALTHCHECK_INTERVAL = 60   # seconds between checks
+HEALTHCHECK_TIMEOUT = 20    # seconds to wait for a single check
+HEALTHCHECK_MAX_FAILURES = 3  # consecutive failures before forcing a restart
+
+
+async def watchdog():
+    """Actively probe the Telegram connection.
+
+    Pyrogram keeps the connection alive in background tasks, so a dead
+    socket never raises inside main() — it just logs "Connection lost"
+    forever while the process stays up. We periodically make a real
+    round-trip request; if it keeps failing, the connection is wedged and
+    the only reliable fix is a fresh process (Docker's restart policy
+    brings us back). This is the automatic equivalent of a manual restart.
+    """
+    failures = 0
+    while True:
+        await asyncio.sleep(HEALTHCHECK_INTERVAL)
+        try:
+            await asyncio.wait_for(app.get_me(), timeout=HEALTHCHECK_TIMEOUT)
+            if failures:
+                log.info("Healthcheck recovered.")
+            failures = 0
+        except Exception as e:
+            failures += 1
+            log.warning(
+                f"Healthcheck failed ({failures}/{HEALTHCHECK_MAX_FAILURES}): "
+                f"{type(e).__name__}: {e}"
+            )
+            if failures >= HEALTHCHECK_MAX_FAILURES:
+                log.error("Connection appears dead — exiting for a fresh restart.")
+                try:
+                    await asyncio.wait_for(app.stop(), timeout=10)
+                except Exception:
+                    pass
+                # Hard-exit: the internal session is wedged, so don't rely on
+                # a clean shutdown. Docker (restart: unless-stopped) restarts us.
+                os._exit(1)
+
+
+# Bot start with auto-reconnect
+async def main():
+    backoff = 5
+    max_backoff = 300  # 5 minutes max
+
+    while True:
+        try:
+            log.info("Starting bot...")
+            await app.start()
+            log.info("Bot started successfully!")
+            backoff = 5  # reset on successful start
+
+            # Block here while actively watching the connection.
+            await watchdog()
+
+        except AuthKeyDuplicated:
+            log.error("Auth key duplicated — session conflict. Exiting.")
+            break
+
+        except KeyboardInterrupt:
+            log.info("Shutting down by user request.")
+            break
+
+        except Exception as e:
+            log.error(f"Bot crashed: {type(e).__name__}: {e}")
+            log.info(f"Reconnecting in {backoff}s...")
+            try:
+                await app.stop()
+            except Exception:
+                pass
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+
+    try:
+        await app.stop()
+    except Exception:
+        pass
+
+app.run(main())
