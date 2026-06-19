@@ -84,6 +84,8 @@ To add previously excluded users back:
 The bot is containerized using Docker and includes:
 - Python 3.10 Alpine base image (~76 MB)
 - Redis for data storage
+- Persistent Pyrogram session (stored in a Docker volume) so restarts reuse the
+  auth key instead of creating a new one
 - Automatic restart on failure, plus a connection watchdog that recovers stale sessions
 - Log rotation
 
@@ -103,6 +105,7 @@ docker run -d --name mention_all_bot_redis \
 
 docker run -d --name mention_all_bot \
   --network mention_all_bot --restart unless-stopped \
+  -v mention_all_bot_session:/data \
   -e TELEGRAM_API_ID=your_api_id \
   -e TELEGRAM_API_HASH=your_api_hash \
   -e TELEGRAM_BOT_TOKEN=your_bot_token \
@@ -110,6 +113,9 @@ docker run -d --name mention_all_bot \
   -e REDIS_HOST=mention_all_bot_redis \
   ghcr.io/virusalex/tg-mention-all:latest
 ```
+
+The `-v mention_all_bot_session:/data` volume keeps the Pyrogram session (auth key)
+across restarts. The session file is never baked into the image or committed to git.
 
 For most setups Docker Compose (above) is simpler since it wires up Redis for you.
 
