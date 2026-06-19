@@ -8,6 +8,8 @@ services:
     restart: unless-stopped
     depends_on:
       - redis
+    volumes:
+      - session_data:/data
     logging:
       driver: "json-file"
       options:
@@ -29,3 +31,4 @@ services:
 
 volumes:
   redis_data:
+  session_data:

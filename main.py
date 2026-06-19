@@ -31,12 +31,18 @@ redis_client = redis.Redis(
     decode_responses=True
 )
 
+# Directory for Pyrogram's session file (holds the auth key). Mount it as a
+# volume so restarts reuse the session instead of creating a new auth key
+# (repeated key creation can get throttled by Telegram).
+session_dir = os.environ.get("SESSION_DIR", ".")
+
 # Create Pyrogram client with session name "my_bot"
 app = Client(
     "my_bot",
     api_id=api_id,
     api_hash=api_hash,
-    bot_token=bot_token
+    bot_token=bot_token,
+    workdir=session_dir
 )
 
 async def is_admin(chat_id: int, user_id: int) -> bool:

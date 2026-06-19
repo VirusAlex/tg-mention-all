@@ -7,9 +7,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py ./
 
-# By default, Pyrogram creates a session file in the folder where the script is running
-# If you want, you can redirect to another path:
-# ENV PYROGRAM_SESSION_DIR=/data
-# RUN mkdir /data
+# Store the Pyrogram session under /data so it can be mounted as a volume
+# and survive container recreation (avoids creating a new auth key on restart).
+ENV SESSION_DIR=/data
+RUN mkdir -p /data
 
 CMD ["python", "main.py"]
