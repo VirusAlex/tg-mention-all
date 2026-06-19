@@ -2,14 +2,18 @@
 
 A Telegram bot that helps mention all members in a group chat. Built with Python and Pyrogram.
 
+[![Docker image](https://img.shields.io/badge/ghcr.io-tg--mention--all-2496ED?logo=docker&logoColor=white)](https://github.com/VirusAlex/tg-mention-all/pkgs/container/tg-mention-all)
+
 ## Features
 
 - Mention all members in a group using `/all` command or `@all` keyword
+- Long member lists are automatically split into multiple messages (4096-char limit)
 - Exclude specific users from mentions (admin only)
 - Include previously excluded users (admin only)
 - View list of excluded users (admin only)
 - Works in group chats only
 - Uses Redis for storing excluded users data
+- Self-healing: a connection watchdog restarts the bot if its Telegram session goes stale
 - Docker support for easy deployment
 
 ## Requirements
@@ -23,8 +27,8 @@ A Telegram bot that helps mention all members in a group chat. Built with Python
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/mention_all_bot.git
-cd mention_all_bot
+git clone https://github.com/VirusAlex/tg-mention-all.git
+cd tg-mention-all
 ```
 
 2. Create `.env` file from example:
@@ -74,10 +78,36 @@ To add previously excluded users back:
 ## Docker Deployment
 
 The bot is containerized using Docker and includes:
-- Python 3.10 slim base image
+- Python 3.10 Alpine base image (~76 MB)
 - Redis for data storage
-- Automatic restart on failure
+- Automatic restart on failure, plus a connection watchdog that recovers stale sessions
 - Log rotation
+
+### Run with the pre-built image
+
+A ready-to-use image is published to GitHub Container Registry on every push to `master`:
+`ghcr.io/virusalex/tg-mention-all:latest`
+
+The bot needs a Redis instance, so run both on a shared network:
+
+```bash
+docker network create mention_all_bot
+
+docker run -d --name mention_all_bot_redis \
+  --network mention_all_bot --restart unless-stopped \
+  redis:alpine redis-server --appendonly yes
+
+docker run -d --name mention_all_bot \
+  --network mention_all_bot --restart unless-stopped \
+  -e TELEGRAM_API_ID=your_api_id \
+  -e TELEGRAM_API_HASH=your_api_hash \
+  -e TELEGRAM_BOT_TOKEN=your_bot_token \
+  -e OWNER_USERNAME=@your_username \
+  -e REDIS_HOST=mention_all_bot_redis \
+  ghcr.io/virusalex/tg-mention-all:latest
+```
+
+For most setups Docker Compose (above) is simpler since it wires up Redis for you.
 
 ### Container Management
 
