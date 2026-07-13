@@ -37,12 +37,15 @@ redis_client = redis.Redis(
 session_dir = os.environ.get("SESSION_DIR", ".")
 
 # Create Pyrogram client with session name "my_bot"
+# sleep_threshold: auto-wait out Telegram flood limits (FLOOD_WAIT) up to this
+# many seconds instead of raising, so large @all mentions still get delivered.
 app = Client(
     "my_bot",
     api_id=api_id,
     api_hash=api_hash,
     bot_token=bot_token,
-    workdir=session_dir
+    workdir=session_dir,
+    sleep_threshold=60
 )
 
 async def is_admin(chat_id: int, user_id: int) -> bool:
@@ -242,6 +245,9 @@ async def mention_all(client, message):
                 chunks.append(current_chunk)
 
             for i, chunk in enumerate(chunks):
+                # Small pause between chunks to avoid tripping Telegram's flood limit
+                if i > 0:
+                    await asyncio.sleep(2)
                 await message.reply_text(
                     chunk,
                     disable_web_page_preview=True,
