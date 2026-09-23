@@ -297,6 +297,24 @@ async def watchdog():
                 os._exit(1)
 
 
+async def reset_client():
+    """Tear the client down completely, whatever state a failed start left.
+
+    app.stop() only works on a fully started client. If app.start() fails
+    after connecting (e.g. its get_me() call times out), stop() raises
+    "already terminated" and the client stays connected — every later
+    app.start() then fails with "Client is already connected" and the bot
+    never recovers. Such a half-started client must be disconnected directly.
+    """
+    try:
+        if app.is_initialized:
+            await app.stop()
+        elif app.is_connected:
+            await app.disconnect()
+    except Exception as e:
+        log.warning(f"Client cleanup failed: {type(e).__name__}: {e}")
+
+
 # Bot start with auto-reconnect
 async def main():
     backoff = 5
@@ -322,17 +340,16 @@ async def main():
 
         except Exception as e:
             log.error(f"Bot crashed: {type(e).__name__}: {e}")
+            await reset_client()
+            if app.is_connected or app.is_initialized:
+                # Retrying in-process would fail forever; Docker
+                # (restart: unless-stopped) brings us back as a fresh process.
+                log.error("Client stuck half-started — exiting for a fresh restart.")
+                os._exit(1)
             log.info(f"Reconnecting in {backoff}s...")
-            try:
-                await app.stop()
-            except Exception:
-                pass
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, max_backoff)
 
-    try:
-        await app.stop()
-    except Exception:
-        pass
+    await reset_client()
 
 app.run(main())
