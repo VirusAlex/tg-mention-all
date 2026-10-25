@@ -3,9 +3,9 @@ import json
 import asyncio
 import logging
 from pyrogram import Client, filters
-from pyrogram.errors import AuthKeyDuplicated, UserNotParticipant
+from pyrogram.errors import AuthKeyDuplicated, MessageNotModified, UserNotParticipant
 import redis
-from pyrogram.types import Message
+from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from pyrogram.enums import ChatMemberStatus, ChatType, ParseMode
 
 logging.basicConfig(
@@ -273,6 +273,73 @@ async def list_excluded(client: Client, message: Message):
         await message.reply_text(f"Error getting excluded users list: {str(e)}")
 
 
+WHO_CHOICES = {"admins": "Admins only", "everyone": "Everyone"}
+WHOM_CHOICES = {"list": "Only the list", "all": "All members"}
+
+
+def setting_buttons(chat_id: int, name: str, view: str) -> list:
+    """One keyboard row for a setting; the current choice is ticked.
+    view says which message to redraw after a tap: "single" or "settings"."""
+    choices = WHO_CHOICES if name == "who" else WHOM_CHOICES
+    current = get_setting(chat_id, name)
+    return [
+        InlineKeyboardButton(("✅ " if value == current else "") + label, callback_data=f"set:{name}:{value}:{view}")
+        for value, label in choices.items()
+    ]
+
+
+def who_text(chat_id: int) -> str:
+    current = "admins and allowed users" if get_setting(chat_id, "who") == "admins" else "everyone"
+    return (
+        f"Who can use @all now: {current}.\n\n"
+        "/whocan admins - only admins and users allowed with /allow\n"
+        "/whocan everyone - every member"
+    )
+
+
+def whom_text(chat_id: int) -> str:
+    if get_setting(chat_id, "whom") == "list":
+        current = f"only the mention list ({redis_client.scard(mention_list_key(chat_id))})"
+    else:
+        current = "all members except excluded users"
+    return (
+        f"Who gets mentioned now: {current}.\n\n"
+        "/mentionmode list - only people added with /include\n"
+        "/mentionmode all - all members except excluded users"
+    )
+
+
+def describe_users(title: str, ids: set, limit: int = 30) -> str:
+    if not ids:
+        return f"{title}: none"
+    names = []
+    for user_id in sorted(ids)[:limit]:
+        info = stored_user(user_id)
+        names.append(display_name(user_id, info.get("username"), info.get("first_name"))[:32])
+    more = f" and {len(ids) - limit} more" if len(ids) > limit else ""
+    return f"{title} ({len(ids)}): " + ", ".join(names) + more
+
+
+def settings_text(chat_id: int) -> str:
+    admins_only = get_setting(chat_id, "who") == "admins"
+    list_mode = get_setting(chat_id, "whom") == "list"
+    return (
+        "⚙️ Settings for this chat\n\n"
+        f"Who can use @all: {'admins and allowed users' if admins_only else 'everyone'} (/whocan)\n"
+        f"Who gets mentioned: {'only the mention list' if list_mode else 'all members except excluded users'} (/mentionmode)\n\n"
+        + describe_users("Allowed users", user_ids(allowed_key(chat_id))) + "\n"
+        + describe_users("Mention list", user_ids(mention_list_key(chat_id))) + "\n"
+        + describe_users("Excluded users", get_excluded_users(chat_id))
+    )
+
+
+def settings_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        setting_buttons(chat_id, "who", "settings"),
+        setting_buttons(chat_id, "whom", "settings"),
+    ])
+
+
 @app.on_message(filters.command(["whocan"]))
 async def set_who(client: Client, message: Message):
     if not await check_group_admin(message):
@@ -290,11 +357,10 @@ async def set_who(client: Client, message: Message):
         set_setting(chat_id, "who", "everyone")
         await message.reply_text("✅ Everyone can use @all again.")
     else:
-        current = "admins and allowed users" if get_setting(chat_id, "who") == "admins" else "everyone"
+        # Tapping /whocan in a message sends it without an argument: offer buttons.
         await message.reply_text(
-            f"Who can use @all now: {current}.\n\n"
-            "/whocan admins - only admins and users allowed with /allow\n"
-            "/whocan everyone - every member"
+            who_text(chat_id),
+            reply_markup=InlineKeyboardMarkup([setting_buttons(chat_id, "who", "single")])
         )
 
 
@@ -319,23 +385,10 @@ async def set_whom(client: Client, message: Message):
             "Stop mentioning someone with /exclude @username, see the list with /excluded."
         )
     else:
-        current = "only the mention list" if get_setting(chat_id, "whom") == "list" else "all members except excluded users"
         await message.reply_text(
-            f"Who gets mentioned now: {current}.\n\n"
-            "/mentionmode list - only people added with /include\n"
-            "/mentionmode all - all members except excluded users"
+            whom_text(chat_id),
+            reply_markup=InlineKeyboardMarkup([setting_buttons(chat_id, "whom", "single")])
         )
-
-
-def describe_users(title: str, ids: set, limit: int = 30) -> str:
-    if not ids:
-        return f"{title}: none"
-    names = []
-    for user_id in sorted(ids)[:limit]:
-        info = stored_user(user_id)
-        names.append(display_name(user_id, info.get("username"), info.get("first_name"))[:32])
-    more = f" and {len(ids) - limit} more" if len(ids) > limit else ""
-    return f"{title} ({len(ids)}): " + ", ".join(names) + more
 
 
 @app.on_message(filters.command(["settings"]))
@@ -343,18 +396,47 @@ async def show_settings(client: Client, message: Message):
     if not await check_group_admin(message):
         return
     chat_id = message.chat.id
-    admins_only = get_setting(chat_id, "who") == "admins"
-    list_mode = get_setting(chat_id, "whom") == "list"
-
     await message.reply_text(
-        "⚙️ Settings for this chat\n\n"
-        f"Who can use @all: {'admins and allowed users' if admins_only else 'everyone'} (/whocan)\n"
-        f"Who gets mentioned: {'only the mention list' if list_mode else 'all members except excluded users'} (/mentionmode)\n\n"
-        + describe_users("Allowed users", user_ids(allowed_key(chat_id))) + "\n"
-        + describe_users("Mention list", user_ids(mention_list_key(chat_id))) + "\n"
-        + describe_users("Excluded users", get_excluded_users(chat_id)),
-        parse_mode=ParseMode.DISABLED
+        settings_text(chat_id),
+        parse_mode=ParseMode.DISABLED,
+        reply_markup=settings_keyboard(chat_id)
     )
+
+
+@app.on_callback_query(filters.regex(r"^set:(who|whom):(\w+):(single|settings)$"))
+async def settings_button(client: Client, callback: CallbackQuery):
+    _, name, value, view = callback.data.split(":")
+    message = callback.message
+    choices = WHO_CHOICES if name == "who" else WHOM_CHOICES
+    if message is None or value not in choices:
+        await callback.answer()
+        return
+    chat_id = message.chat.id
+
+    if not await is_admin(chat_id, callback.from_user.id):
+        await callback.answer("Only admins can change these settings.", show_alert=True)
+        return
+    if get_setting(chat_id, name) == value:
+        await callback.answer("Already set.")
+        return
+
+    set_setting(chat_id, name, value)
+    await callback.answer(f"✅ {choices[value]}")
+    try:
+        if view == "settings":
+            await message.edit_text(settings_text(chat_id), parse_mode=ParseMode.DISABLED,
+                                    reply_markup=settings_keyboard(chat_id))
+        elif name == "who":
+            await message.edit_text(who_text(chat_id),
+                                    reply_markup=InlineKeyboardMarkup([setting_buttons(chat_id, "who", "single")]))
+        else:
+            await message.edit_text(whom_text(chat_id),
+                                    reply_markup=InlineKeyboardMarkup([setting_buttons(chat_id, "whom", "single")]))
+    except MessageNotModified:
+        pass
+    except Exception as e:
+        # The setting is saved either way; the old message may just be gone.
+        log.warning(f"Couldn't refresh settings message: {type(e).__name__}: {e}")
 
 
 HELP_TEXT = f"""
