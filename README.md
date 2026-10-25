@@ -15,6 +15,7 @@ A Telegram bot that helps mention all members in a group chat. Built with Python
 - Exclude specific users from mentions (admin only)
 - Include previously excluded users (admin only)
 - View list of excluded users (admin only)
+- Per-chat settings (admin only): limit `@all` to admins and allowed users, or mention only a chosen list of people
 - Works in group chats only
 - Uses Redis for storing excluded users data
 - Self-healing: a connection watchdog restarts the bot if its Telegram session goes stale
@@ -61,6 +62,15 @@ docker-compose up -d
 - `/excluded` - Show list of excluded users (admin only)
 - `/info` - Show help message
 
+Settings (admin only):
+
+- `/settings` - Show this chat's settings and lists
+- `/whocan admins` / `/whocan everyone` - Who can use `@all`: only admins and allowed users, or every member (default)
+- `/allow`, `/disallow` - Add or remove a user who may use `@all` when `/whocan admins` is on
+- `/mentionmode list` / `/mentionmode all` - Mention only the people on the chat's mention list, or all members except excluded ones (default)
+
+Every user command accepts a reply to the user's message or one or more `@username`s, e.g. `/include @alice @bob`.
+
 ## Usage
 
 1. Add the bot to your group
@@ -78,6 +88,23 @@ Administrators can exclude users in two ways:
 To add previously excluded users back:
 - Reply to a user's message with `/include`
 - Use `/include @username`
+
+### Restricting who can mention everyone
+
+In big groups you may not want every member to be able to ping everyone:
+
+1. `/whocan admins` - from now on only admins can use `@all` / `/all`; others get a reply that they don't have permission
+2. `/allow @username` - also let a specific non-admin use it (`/disallow @username` to undo)
+
+### Mentioning only a list of people
+
+Instead of all members, `@all` can mention a fixed list:
+
+1. `/mentionmode list`
+2. `/include @alice @bob` adds people to the list, `/exclude @alice` removes them
+3. `/mentionmode all` switches back; the list and the excluded users are both kept
+
+Chats that never change these settings keep the default behaviour.
 
 ## Docker Deployment
 
