@@ -186,7 +186,9 @@ For questions and support, contact {owner_username}
 async def show_info(client: Client, message: Message):
     await message.reply_text(HELP_TEXT)
 
-@app.on_message(filters.command(["all"]) | filters.regex(r"@all"))
+# Whole word only: a bare r"@all" also matched @allah, @alliance_chat,
+# @all_news... and mass-mentioned the group by accident.
+@app.on_message(filters.command(["all"]) | filters.regex(r"(?<!\w)@all\b"))
 async def mention_all(client, message):
     chat_id = message.chat.id
 
