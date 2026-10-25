@@ -262,6 +262,7 @@ async def mention_all(client, message):
 HEALTHCHECK_INTERVAL = 60   # seconds between checks
 HEALTHCHECK_TIMEOUT = 20    # seconds to wait for a single check
 HEALTHCHECK_MAX_FAILURES = 3  # consecutive failures before forcing a restart
+SESSION_SAVE_EVERY = 10     # healthchecks between session commits (~10 min)
 
 
 async def watchdog():
@@ -273,8 +274,14 @@ async def watchdog():
     round-trip request; if it keeps failing, the connection is wedged and
     the only reliable fix is a fresh process (Docker's restart policy
     brings us back). This is the automatic equivalent of a manual restart.
+
+    It also commits the session file now and then: Pyrogram writes the peer
+    cache (users/chats and their access hashes) without committing and only
+    commits on a clean stop, which a container restart never is — so every
+    restart used to roll the cache back to the last clean stop.
     """
     failures = 0
+    checks = 0
     while True:
         await asyncio.sleep(HEALTHCHECK_INTERVAL)
         try:
@@ -282,6 +289,12 @@ async def watchdog():
             if failures:
                 log.info("Healthcheck recovered.")
             failures = 0
+            checks += 1
+            if checks % SESSION_SAVE_EVERY == 0:
+                try:
+                    await app.storage.save()
+                except Exception as e:
+                    log.warning(f"Session save failed: {type(e).__name__}: {e}")
         except Exception as e:
             failures += 1
             log.warning(
