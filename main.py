@@ -167,7 +167,7 @@ async def list_excluded(client: Client, message: Message):
     except Exception as e:
         await message.reply_text(f"Error getting excluded users list: {str(e)}")
 
-HELP_TEXT = """
+HELP_TEXT = f"""
 👋 Hello! I'm a bot that helps mention all members in a group.
 
 Commands:
