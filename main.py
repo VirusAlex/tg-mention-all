@@ -1,11 +1,12 @@
 import os
+import json
 import asyncio
 import logging
 from pyrogram import Client, filters
-from pyrogram.errors import AuthKeyDuplicated
+from pyrogram.errors import AuthKeyDuplicated, UserNotParticipant
 import redis
 from pyrogram.types import Message
-from pyrogram.enums import ChatMemberStatus, ChatType
+from pyrogram.enums import ChatMemberStatus, ChatType, ParseMode
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,6 +49,76 @@ app = Client(
     sleep_threshold=60
 )
 
+# Per-chat settings. A chat that never changed them keeps the original
+# behaviour: anyone can use @all, and it mentions every member except the
+# excluded ones.
+#   who:  "everyone" | "admins" (admins plus users allowed with /allow)
+#   whom: "all"      | "list"   (only users added with /include)
+SETTINGS_DEFAULTS = {"who": "everyone", "whom": "all"}
+
+GROUP_ONLY_TEXT = (
+    "⚠️ This command only works in groups!\n\n"
+    "Add me to a group and try again."
+)
+NO_PERMISSION_TEXT = (
+    "⛔ You don't have permission to use this. In this chat only admins "
+    "and users they allow can mention everyone."
+)
+
+
+def get_setting(chat_id: int, name: str) -> str:
+    return redis_client.hget(f"settings:{chat_id}", name) or SETTINGS_DEFAULTS[name]
+
+
+def set_setting(chat_id: int, name: str, value: str):
+    redis_client.hset(f"settings:{chat_id}", name, value)
+
+
+def excluded_key(chat_id: int) -> str:
+    return f"excluded_users:{chat_id}"
+
+
+def mention_list_key(chat_id: int) -> str:
+    return f"mention_list:{chat_id}"
+
+
+def allowed_key(chat_id: int) -> str:
+    return f"allowed_users:{chat_id}"
+
+
+def user_ids(key: str) -> set:
+    return {int(member) for member in redis_client.smembers(key)}
+
+
+def get_excluded_users(chat_id: int) -> set:
+    """Get list of excluded users for the chat"""
+    return user_ids(excluded_key(chat_id))
+
+
+def remember_user(user):
+    """Keep the user's name so lists can be shown and mentioned without
+    resolving them through Telegram again."""
+    redis_client.hset("user_names", user.id, json.dumps(
+        {"username": user.username, "first_name": user.first_name}
+    ))
+
+
+def stored_user(user_id: int) -> dict:
+    raw = redis_client.hget("user_names", user_id)
+    return json.loads(raw) if raw else {}
+
+
+def display_name(user_id: int, username=None, first_name=None) -> str:
+    # No "@" on purpose: replies would ping the user.
+    return username or first_name or f"ID {user_id}"
+
+
+def format_mention(user_id: int, username=None, first_name=None) -> str:
+    if username:
+        return f"@{username}"
+    return f"[{first_name or 'NoName'}](tg://user?id={user_id})"
+
+
 async def is_admin(chat_id: int, user_id: int) -> bool:
     try:
         member = await app.get_chat_member(chat_id, user_id)
@@ -55,99 +126,133 @@ async def is_admin(chat_id: int, user_id: int) -> bool:
     except Exception:
         return False
 
-def get_excluded_users(chat_id: int) -> set:
-    """Get list of excluded users for the chat"""
-    key = f"excluded_users:{chat_id}"
-    members = redis_client.smembers(key)
-    return {int(member) for member in members}
+
+async def sender_is_admin(message: Message) -> bool:
+    # Anonymous admins post on behalf of the group itself and have no from_user.
+    if message.sender_chat and message.sender_chat.id == message.chat.id:
+        return True
+    if not message.from_user:
+        return False
+    return await is_admin(message.chat.id, message.from_user.id)
+
+
+async def can_mention_all(message: Message) -> bool:
+    if get_setting(message.chat.id, "who") != "admins":
+        return True
+    if message.from_user and redis_client.sismember(allowed_key(message.chat.id), message.from_user.id):
+        return True
+    return await sender_is_admin(message)
+
+
+async def check_group_admin(message: Message) -> bool:
+    """Reply and return False unless this is a group and the sender is an admin."""
+    if message.chat.type == ChatType.PRIVATE:
+        await message.reply_text(GROUP_ONLY_TEXT)
+        return False
+    if not await sender_is_admin(message):
+        await message.reply_text("This command is only available to administrators.")
+        return False
+    return True
+
+
+async def for_each_target(message: Message, verb: str, action):
+    """Apply action(user) to the replied-to user or to every @username / ID
+    given after the command, and reply with one line per user."""
+    if message.reply_to_message:
+        user = message.reply_to_message.from_user
+        if not user:
+            await message.reply_text("Can't tell who wrote that message. Specify their @username instead.")
+            return
+        targets = [user]
+    elif len(message.command) >= 2:
+        targets = message.command[1:]
+    else:
+        await message.reply_text("Reply to a user's message or specify their @username")
+        return
+
+    lines = []
+    for target in targets:
+        label = target if isinstance(target, str) else display_name(target.id, target.username, target.first_name)
+        try:
+            if isinstance(target, str):
+                ref = target.lstrip("@")
+                target = await app.get_users(int(ref) if ref.lstrip("-").isdigit() else ref)
+            remember_user(target)
+            lines.append(action(target))
+        except Exception as e:
+            lines.append(f"Failed to {verb} {label}: {str(e)}")
+    # Names are user-controlled: send them as plain text.
+    await message.reply_text("\n".join(lines), parse_mode=ParseMode.DISABLED)
+
 
 @app.on_message(filters.command(["exclude"]))
 async def exclude_user(client: Client, message: Message):
+    if not await check_group_admin(message):
+        return
     chat_id = message.chat.id
+    list_mode = get_setting(chat_id, "whom") == "list"
 
-    # Check if it's a group chat
-    if message.chat.type == ChatType.PRIVATE:
-        await message.reply_text(
-            "⚠️ This command only works in groups!\n\n"
-            "Add me to a group and try again."
-        )
-        return
-    
-    if not await is_admin(chat_id, message.from_user.id):
-        await message.reply_text("This command is only available to administrators.")
-        return
+    def action(user):
+        name = display_name(user.id, user.username, user.first_name)
+        if list_mode:
+            redis_client.srem(mention_list_key(chat_id), user.id)
+            return f"User {name} has been removed from the mention list"
+        redis_client.sadd(excluded_key(chat_id), user.id)
+        return f"User {name} has been excluded from @all mentions"
 
-    if not message.reply_to_message and len(message.command) < 2:
-        await message.reply_text("Reply to a user's message or specify their @username")
-        return
+    await for_each_target(message, "exclude", action)
 
-    try:
-        if message.reply_to_message:
-            user_id = message.reply_to_message.from_user.id
-            username = message.reply_to_message.from_user.username or message.reply_to_message.from_user.first_name
-        else:
-            username = message.command[1].replace("@", "")
-            user = await app.get_users(username)
-            user_id = user.id
-            username = user.username or user.first_name
-
-        key = f"excluded_users:{chat_id}"
-        redis_client.sadd(key, user_id)
-        await message.reply_text(f"User {username} has been excluded from @all mentions")
-    except Exception as e:
-        await message.reply_text(f"Failed to exclude user: {str(e)}")
 
 @app.on_message(filters.command(["include"]))
 async def include_user(client: Client, message: Message):
+    if not await check_group_admin(message):
+        return
+    chat_id = message.chat.id
+    list_mode = get_setting(chat_id, "whom") == "list"
+
+    def action(user):
+        name = display_name(user.id, user.username, user.first_name)
+        if list_mode:
+            redis_client.sadd(mention_list_key(chat_id), user.id)
+            return f"User {name} has been added to the mention list"
+        redis_client.srem(excluded_key(chat_id), user.id)
+        return f"User {name} will now receive @all mentions again"
+
+    await for_each_target(message, "include", action)
+
+
+@app.on_message(filters.command(["allow"]))
+async def allow_user(client: Client, message: Message):
+    if not await check_group_admin(message):
+        return
+    chat_id = message.chat.id
+    note = "" if get_setting(chat_id, "who") == "admins" else " (takes effect after /whocan admins)"
+
+    def action(user):
+        redis_client.sadd(allowed_key(chat_id), user.id)
+        return f"User {display_name(user.id, user.username, user.first_name)} can now use @all{note}"
+
+    await for_each_target(message, "allow", action)
+
+
+@app.on_message(filters.command(["disallow"]))
+async def disallow_user(client: Client, message: Message):
+    if not await check_group_admin(message):
+        return
     chat_id = message.chat.id
 
-    # Check if it's a group chat
-    if message.chat.type == ChatType.PRIVATE:
-        await message.reply_text(
-            "⚠️ This command only works in groups!\n\n"
-            "Add me to a group and try again."
-        )
-        return
-    
-    if not await is_admin(chat_id, message.from_user.id):
-        await message.reply_text("This command is only available to administrators.")
-        return
+    def action(user):
+        redis_client.srem(allowed_key(chat_id), user.id)
+        return f"User {display_name(user.id, user.username, user.first_name)} is no longer allowed to use @all"
 
-    if not message.reply_to_message and len(message.command) < 2:
-        await message.reply_text("Reply to a user's message or specify their @username")
-        return
+    await for_each_target(message, "disallow", action)
 
-    try:
-        if message.reply_to_message:
-            user_id = message.reply_to_message.from_user.id
-            username = message.reply_to_message.from_user.username or message.reply_to_message.from_user.first_name
-        else:
-            username = message.command[1].replace("@", "")
-            user = await app.get_users(username)
-            user_id = user.id
-            username = user.username or user.first_name
-
-        key = f"excluded_users:{chat_id}"
-        redis_client.srem(key, user_id)
-        await message.reply_text(f"User {username} will now receive @all mentions again")
-    except Exception as e:
-        await message.reply_text(f"Failed to include user: {str(e)}")
 
 @app.on_message(filters.command(["excluded"]))
 async def list_excluded(client: Client, message: Message):
+    if not await check_group_admin(message):
+        return
     chat_id = message.chat.id
-
-    # Check if it's a group chat
-    if message.chat.type == ChatType.PRIVATE:
-        await message.reply_text(
-            "⚠️ This command only works in groups!\n\n"
-            "Add me to a group and try again."
-        )
-        return
-    
-    if not await is_admin(chat_id, message.from_user.id):
-        await message.reply_text("This command is only available to administrators.")
-        return
 
     try:
         excluded_users = get_excluded_users(chat_id)
@@ -162,10 +267,95 @@ async def list_excluded(client: Client, message: Message):
                 text += f"- {user.username or user.first_name} (ID: {user.id})\n"
             except:
                 text += f"- Unknown User (ID: {user_id})\n"
-        
+
         await message.reply_text(text)
     except Exception as e:
         await message.reply_text(f"Error getting excluded users list: {str(e)}")
+
+
+@app.on_message(filters.command(["whocan"]))
+async def set_who(client: Client, message: Message):
+    if not await check_group_admin(message):
+        return
+    chat_id = message.chat.id
+    choice = message.command[1].lower() if len(message.command) > 1 else ""
+
+    if choice == "admins":
+        set_setting(chat_id, "who", "admins")
+        await message.reply_text(
+            "✅ Now only admins and allowed users can use @all.\n"
+            "Allow someone with /allow @username (or reply to their message)."
+        )
+    elif choice == "everyone":
+        set_setting(chat_id, "who", "everyone")
+        await message.reply_text("✅ Everyone can use @all again.")
+    else:
+        current = "admins and allowed users" if get_setting(chat_id, "who") == "admins" else "everyone"
+        await message.reply_text(
+            f"Who can use @all now: {current}.\n\n"
+            "/whocan admins - only admins and users allowed with /allow\n"
+            "/whocan everyone - every member"
+        )
+
+
+@app.on_message(filters.command(["mentionmode"]))
+async def set_whom(client: Client, message: Message):
+    if not await check_group_admin(message):
+        return
+    chat_id = message.chat.id
+    choice = message.command[1].lower() if len(message.command) > 1 else ""
+
+    if choice == "list":
+        set_setting(chat_id, "whom", "list")
+        count = redis_client.scard(mention_list_key(chat_id))
+        await message.reply_text(
+            f"✅ @all now mentions only the people on the mention list ({count}).\n"
+            "Add people with /include @username, remove them with /exclude @username."
+        )
+    elif choice == "all":
+        set_setting(chat_id, "whom", "all")
+        await message.reply_text(
+            "✅ @all mentions all members again (except excluded users).\n"
+            "Stop mentioning someone with /exclude @username, see the list with /excluded."
+        )
+    else:
+        current = "only the mention list" if get_setting(chat_id, "whom") == "list" else "all members except excluded users"
+        await message.reply_text(
+            f"Who gets mentioned now: {current}.\n\n"
+            "/mentionmode list - only people added with /include\n"
+            "/mentionmode all - all members except excluded users"
+        )
+
+
+def describe_users(title: str, ids: set, limit: int = 30) -> str:
+    if not ids:
+        return f"{title}: none"
+    names = []
+    for user_id in sorted(ids)[:limit]:
+        info = stored_user(user_id)
+        names.append(display_name(user_id, info.get("username"), info.get("first_name"))[:32])
+    more = f" and {len(ids) - limit} more" if len(ids) > limit else ""
+    return f"{title} ({len(ids)}): " + ", ".join(names) + more
+
+
+@app.on_message(filters.command(["settings"]))
+async def show_settings(client: Client, message: Message):
+    if not await check_group_admin(message):
+        return
+    chat_id = message.chat.id
+    admins_only = get_setting(chat_id, "who") == "admins"
+    list_mode = get_setting(chat_id, "whom") == "list"
+
+    await message.reply_text(
+        "⚙️ Settings for this chat\n\n"
+        f"Who can use @all: {'admins and allowed users' if admins_only else 'everyone'} (/whocan)\n"
+        f"Who gets mentioned: {'only the mention list' if list_mode else 'all members except excluded users'} (/mentionmode)\n\n"
+        + describe_users("Allowed users", user_ids(allowed_key(chat_id))) + "\n"
+        + describe_users("Mention list", user_ids(mention_list_key(chat_id))) + "\n"
+        + describe_users("Excluded users", get_excluded_users(chat_id)),
+        parse_mode=ParseMode.DISABLED
+    )
+
 
 HELP_TEXT = f"""
 👋 Hello! I'm a bot that helps mention all members in a group.
@@ -177,6 +367,18 @@ Commands:
 • /excluded - Show list of excluded users (admin only)
 • /info - Show this help message
 
+Settings (admin only):
+• /settings - Show this chat's settings
+• /whocan admins - Only admins and allowed users can use @all (/whocan everyone to undo)
+• /allow, /disallow - Let a user use @all when /whocan admins is on
+• /mentionmode list - Mention only a chosen list of people instead of all members (/mentionmode all to undo)
+
+In list mode /include adds a user to the list and /exclude removes them. Excluded users are kept and are skipped again after /mentionmode all.
+
+How to choose users for /exclude, /include, /allow and /disallow:
+• send the command as a reply to the user's message, or
+• write usernames after the command, separated by spaces: `/include @username1 @username2`
+
 Note: I only work in groups, not in private chats!
 
 For questions and support, contact {owner_username}
@@ -185,6 +387,77 @@ For questions and support, contact {owner_username}
 @app.on_message(filters.command(["start", "info"]))
 async def show_info(client: Client, message: Message):
     await message.reply_text(HELP_TEXT)
+
+
+async def member_mentions(client: Client, chat_id: int, from_user) -> list:
+    """Everyone in the chat except bots, the caller and excluded users."""
+    excluded_users = get_excluded_users(chat_id)
+    mentions = []
+    async for member in client.get_chat_members(chat_id):
+        user = member.user
+
+        # Skip bots
+        if user.is_bot:
+            continue
+
+        # Skip author of the command
+        if from_user and user.id == from_user.id:
+            continue
+
+        # Skip excluded users
+        if user.id in excluded_users:
+            continue
+
+        mentions.append(format_mention(user.id, user.username, user.first_name))
+    return mentions
+
+
+async def list_mentions(client: Client, chat_id: int, from_user) -> list:
+    """Only the users on the chat's mention list who are still in the chat."""
+    mentions = []
+    for user_id in sorted(user_ids(mention_list_key(chat_id))):
+        if from_user and user_id == from_user.id:
+            continue
+        try:
+            member = await client.get_chat_member(chat_id, user_id)
+        except UserNotParticipant:
+            continue
+        except Exception:
+            # Telegram couldn't resolve the user right now (e.g. the session's
+            # peer cache lost them): fall back to the name saved by /include.
+            info = stored_user(user_id)
+            mentions.append(format_mention(user_id, info.get("username"), info.get("first_name")))
+            continue
+        if member.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+            continue
+        remember_user(member.user)
+        mentions.append(format_mention(user_id, member.user.username, member.user.first_name))
+    return mentions
+
+
+async def send_mentions(message: Message, mentions: list):
+    max_length = 4096
+    chunks = []
+    current_chunk = ""
+    for mention in mentions:
+        if current_chunk and len(current_chunk) + 1 + len(mention) > max_length:
+            chunks.append(current_chunk)
+            current_chunk = mention
+        else:
+            current_chunk = f"{current_chunk} {mention}" if current_chunk else mention
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    for i, chunk in enumerate(chunks):
+        # Small pause between chunks to avoid tripping Telegram's flood limit
+        if i > 0:
+            await asyncio.sleep(2)
+        await message.reply_text(
+            chunk,
+            disable_web_page_preview=True,
+            quote=(i == 0)
+        )
+
 
 # Whole word only: a bare r"@all" also matched @allah, @alliance_chat,
 # @all_news... and mass-mentioned the group by accident.
@@ -200,61 +473,26 @@ async def mention_all(client, message):
         )
         return
 
-    # Get list of excluded users
-    excluded_users = get_excluded_users(chat_id)
-    
-    mentions = []
-    from_user = message.from_user
+    if not await can_mention_all(message):
+        await message.reply_text(NO_PERMISSION_TEXT)
+        return
 
     try:
-        async for member in client.get_chat_members(chat_id):
-            user = member.user
+        if get_setting(chat_id, "whom") == "list":
+            if not redis_client.scard(mention_list_key(chat_id)):
+                await message.reply_text(
+                    "No one to mention: the mention list is empty.\n"
+                    "Admins can add people with /include @username."
+                )
+                return
+            mentions = await list_mentions(client, chat_id, message.from_user)
+        else:
+            mentions = await member_mentions(client, chat_id, message.from_user)
 
-            # Skip bots
-            if user.is_bot:
-                continue
-
-            # Skip author of the command
-            if from_user and user.id == from_user.id:
-                continue
-
-            # Skip excluded users
-            if user.id in excluded_users:
-                continue
-
-            # If there is a username - use @username
-            if user.username:
-                mentions.append(f"@{user.username}")
-            else:
-                # Otherwise Markdown mention
-                name = user.first_name or "NoName"
-                mentions.append(f"[{name}](tg://user?id={user.id})")
-
-        # Form the final text, splitting into chunks if needed
         if not mentions:
             await message.reply_text("No suitable members found to mention.")
         else:
-            max_length = 4096
-            chunks = []
-            current_chunk = ""
-            for mention in mentions:
-                if current_chunk and len(current_chunk) + 1 + len(mention) > max_length:
-                    chunks.append(current_chunk)
-                    current_chunk = mention
-                else:
-                    current_chunk = f"{current_chunk} {mention}" if current_chunk else mention
-            if current_chunk:
-                chunks.append(current_chunk)
-
-            for i, chunk in enumerate(chunks):
-                # Small pause between chunks to avoid tripping Telegram's flood limit
-                if i > 0:
-                    await asyncio.sleep(2)
-                await message.reply_text(
-                    chunk,
-                    disable_web_page_preview=True,
-                    quote=(i == 0)
-                )
+            await send_mentions(message, mentions)
     except Exception as e:
         await message.reply_text(f"Failed to mention members: {str(e)}")
 
